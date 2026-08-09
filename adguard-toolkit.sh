@@ -276,18 +276,26 @@ install_adguard(){
     return 0
   fi
 
-  yellow "Se va a instalar AdGuard Home con el instalador oficial."
-  yellow "Ocupará el puerto 53; asegúrate de que systemd-resolved u otro DNS no lo tengan."
+  yellow "Se va a instalar AdGuard Home (tarball oficial + 'AdGuardHome -s install')."
+  yellow "Ocupará el puerto 53; si systemd-resolved lo tiene, se libera sin desactivarlo."
   ask "¿Continuar con la instalación de AdGuard Home?" || { yellow "Cancelado."; CONTROLLED=1; return 1; }
 
-  # systemd-resolved es la causa habitual de que :53 esté ocupado.
+  # systemd-resolved es la causa habitual de que :53 esté ocupado. En vez de
+  # desactivarlo, se le quita SOLO el stub de 127.0.0.53:53 y se deja que siga
+  # gestionando el DNS del host: /etc/resolv.conf pasa a apuntar al fichero con
+  # los upstreams reales (los del DHCP/netplan), así el host no pierde salida a
+  # Internet en ningún momento. Drop-in en vez de sed sobre resolved.conf:
+  # cubre el caso de que la directiva no exista en el fichero y sobrevive a
+  # actualizaciones del paquete.
   if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-    yellow "systemd-resolved está activo y suele ocupar el puerto 53."
-    if ask "¿Desactivar systemd-resolved y fijar /etc/resolv.conf a 9.9.9.9?"; then
-      systemctl disable --now systemd-resolved
-      rm -f /etc/resolv.conf
-      printf 'nameserver 9.9.9.9\nnameserver 149.112.112.112\n' > /etc/resolv.conf
-      green "systemd-resolved desactivado."
+    yellow "systemd-resolved está activo y su stub ocupa el puerto 53."
+    if ask "¿Liberar el puerto 53 (DNSStubListener=no) manteniendo systemd-resolved?"; then
+      systemctl stop systemd-resolved
+      mkdir -p /etc/systemd/resolved.conf.d
+      printf '[Resolve]\nDNSStubListener=no\n' > /etc/systemd/resolved.conf.d/99-adguard.conf
+      ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+      systemctl start systemd-resolved
+      green "Puerto 53 libre; systemd-resolved sigue gestionando el DNS del host."
     fi
   fi
 
@@ -295,9 +303,30 @@ install_adguard(){
   apt-get update
   apt-get install -y curl ca-certificates
 
-  info "==> Descargando e instalando AdGuard Home..."
-  curl -fsSL https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh \
-    | sh -s -- -v
+  # Tarball estático oficial en vez del install.sh remoto: mismo resultado
+  # ('AdGuardHome -s install' registra y arranca el servicio systemd), pero sin
+  # ejecutar un script descargado y con la arquitectura detectada en runtime en
+  # vez de asumir amd64. El -f de curl es importante: sin él, un 404 guardaría
+  # la página de error y tar fallaría con un mensaje que no apunta a la causa.
+  local arch
+  case "$(uname -m)" in
+    x86_64)         arch="amd64";;
+    aarch64|arm64)  arch="arm64";;
+    armv7l)         arch="armv7";;
+    armv6l)         arch="armv6";;
+    i486|i586|i686) arch="386";;
+    *) red "Arquitectura no soportada: $(uname -m)"; CONTROLLED=1; return 1;;
+  esac
+  info "==> Descargando AdGuard Home (linux_${arch})..."
+  local tarball
+  tarball="$(mktemp /tmp/adguardhome.XXXXXX.tar.gz)"
+  curl -fsSL "https://static.adguard.com/adguardhome/release/AdGuardHome_linux_${arch}.tar.gz" \
+    -o "$tarball"
+  tar -xzf "$tarball" -C /opt
+  rm -f "$tarball"
+
+  info "==> Registrando el servicio (AdGuardHome -s install)..."
+  /opt/AdGuardHome/AdGuardHome -s install
 
   sleep 3
   detect_adguard

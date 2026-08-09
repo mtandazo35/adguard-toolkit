@@ -174,7 +174,14 @@ También enmascara `unbound-resolvconf.service`, que falla en bucle cuando
 - Pasar de un upstream cifrado (DoT/DoH) a resolución recursiva cambia el modelo de
   privacidad: dejas de confiar en un proveedor único, pero las consultas a los
   servidores autoritativos viajan en claro y tu ISP puede verlas.
-- La rama de instalación de AdGuard Home usa el instalador oficial de AdGuardTeam.
+- La instalación de AdGuard Home descarga el **tarball estático oficial** de
+  `static.adguard.com` (con la arquitectura detectada en runtime: amd64, arm64,
+  armv7...) y registra el servicio con `AdGuardHome -s install`, sin ejecutar
+  scripts remotos. El binario queda en `/opt/AdGuardHome/`.
+- Si `systemd-resolved` ocupa el puerto 53, **no se desactiva**: se le quita solo
+  el stub (`DNSStubListener=no` vía drop-in en `/etc/systemd/resolved.conf.d/`)
+  y `/etc/resolv.conf` pasa a apuntar a `/run/systemd/resolve/resolv.conf`, de
+  modo que el host conserva su DNS de siempre (el del DHCP) en todo momento.
 
 ## Licencia
 
