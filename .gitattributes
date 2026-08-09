@@ -1,0 +1,4 @@
+# Los scripts se ejecutan en Linux: siempre LF, aunque se editen desde Windows.
+# Un CRLF colado rompe `bash <(curl ...)` con errores que no apuntan a la causa.
+* text=auto
+*.sh text eol=lf

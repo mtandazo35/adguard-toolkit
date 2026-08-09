@@ -82,12 +82,12 @@ Modificadores:
 | --- | --- |
 | `-y`, `--yes` | No preguntar nada. Para automatización. |
 | `--port N` | Puerto de Unbound. Por defecto `5335`. |
-| `--keep-fallback` | Conserva el `fallback_dns` externo de AdGuard. |
+| `--no-fallback` | Vacía el `fallback_dns` de AdGuard: Unbound queda como único camino. |
 
 Ejemplo desatendido:
 
 ```bash
-./adguard-toolkit.sh --all --yes --keep-fallback
+./adguard-toolkit.sh --all --yes
 ```
 
 ## Qué configura en Unbound
@@ -99,16 +99,32 @@ según la CPU y la RAM de la máquina.
 
 ## Seguridad de la operación
 
-- Antes de tocar nada guarda una copia del `AdGuardHome.yaml` en
-  `/root/adguard-unbound-backups/<fecha>/`.
-- Tras aplicar el cambio verifica que la cadena completa resuelve. **Si AdGuard no
-  vuelve a responder, restaura sola la configuración anterior** y te deja el DNS
-  funcionando.
+- **Antes de instalar nada comprueba que la red permite recursión.** Pregunta a
+  una IP de TEST-NET (`192.0.2.1`), donde no puede existir ningún DNS: si algo
+  responde, el puerto 53 saliente está interceptado (dst-nat transparente en el
+  router o el ISP) y el script aborta explicando cómo eximir al servidor o usar
+  DoT en su lugar. Sin este chequeo, la instalación "terminaría bien" y el
+  resolver quedaría roto para la mayor parte de Internet.
+- Guarda una copia del `AdGuardHome.yaml` en
+  `/root/adguard-unbound-backups/<fecha>/` — tomada **con AdGuard ya parado**,
+  porque AdGuard reescribe su YAML desde memoria al apagarse y un snapshot en
+  caliente puede ser una versión vieja.
+- Valida la configuración de Unbound **combinada con el resto de `conf.d/`**
+  (`unbound-checkconf` sin argumento); si no valida, restaura la anterior en vez
+  de dejar una configuración rota en disco.
+- Verifica la recursión con **dominios poco consultados** (los populares pueden
+  responder desde cachés intermedias y esconder una recursión a medias) y el
+  DNSSEC con **control positivo y negativo** (firma válida debe traer `ad`,
+  firma inválida debe dar SERVFAIL — solo la pareja distingue una validación
+  real de un resolver roto, que también da SERVFAIL).
+- Tras aplicar el cambio verifica la cadena completa consultando un dominio que
+  no puede salir de la caché de AdGuard. **Si AdGuard no vuelve a responder,
+  restaura sola la configuración anterior** y te deja el DNS funcionando.
 - `--revert-unbound` recupera el último backup y, opcionalmente, desinstala Unbound.
 
 ## Detalles que este script resuelve por ti
 
-Cuatro cosas que rompen la mayoría de guías y scripts que circulan por ahí:
+Cinco cosas que rompen la mayoría de guías y scripts que circulan por ahí:
 
 1. **`auto-trust-anchor-file` duplicado.** Debian ya lo declara en
    `/etc/unbound/unbound.conf.d/root-auto-trust-anchor-file.conf`. Si tu configuración
@@ -124,6 +140,13 @@ Cuatro cosas que rompen la mayoría de guías y scripts que circulan por ahí:
    carga las listas de bloqueo. Comprobar una sola vez hace que una reversión
    automática se dispare sobre una configuración perfectamente válida; aquí se
    reintenta durante 40 segundos.
+5. **Redes con el puerto 53 interceptado.** Muchas redes (ISPs, hoteles, routers
+   con "DNS forzado") redirigen todo el 53 saliente a su propio resolver. Ahí la
+   recursión es imposible: el interceptor solo responde consultas iterativas
+   desde su caché y devuelve SERVFAIL para el resto, con lo que Unbound resuelve
+   los dominios populares y falla los demás — parece un problema de bloqueo o de
+   DNSSEC y no lo es. Este script lo detecta antes de instalar y aborta con el
+   diagnóstico, en vez de dejarte un resolver a medias.
 
 También enmascara `unbound-resolvconf.service`, que falla en bucle cuando
 `/etc/resolv.conf` no es un enlace gestionado por `resolvconf`.
@@ -138,10 +161,16 @@ También enmascara `unbound-resolvconf.service`, que falla en bucle cuando
 
 - **No expongas el puerto de Unbound a Internet ni a tus clientes.** Solo AdGuard
   debe consultarlo.
-- Por defecto se vacía `fallback_dns`, de forma que Unbound sea el único camino. Eso
-  significa que **si Unbound cae, la red se queda sin DNS**. Usa `--keep-fallback` si
-  prefieres tener red de seguridad a costa de que, cuando Unbound falle, algunas
-  consultas salgan a un DNS externo.
+- Por defecto se **conserva** el `fallback_dns` como red de seguridad (y si no
+  había ninguno, se pone `tls://9.9.9.9`): si Unbound cae, AdGuard sigue
+  resolviendo por ahí. Usa `--no-fallback` si prefieres que Unbound sea el único
+  camino, asumiendo que **si Unbound cae, la red entera se queda sin DNS**.
+- Matiz importante: el fallback actúa cuando el upstream **no responde**. Un
+  SERVFAIL sí es una respuesta válida y **no** lo dispara — si Unbound queda
+  vivo pero roto (por ejemplo porque alguien empieza a interceptar el 53
+  saliente), el fallback no te salva. Para ese caso está el chequeo de
+  interceptación: `dig @192.0.2.1 test.com +norec` debe dar *timeout*; si
+  responde, la red está interceptando.
 - Pasar de un upstream cifrado (DoT/DoH) a resolución recursiva cambia el modelo de
   privacidad: dejas de confiar en un proveedor único, pero las consultas a los
   servidores autoritativos viajan en claro y tu ISP puede verlas.

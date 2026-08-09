@@ -17,8 +17,9 @@
 # Modificadores:
 #   --yes | -y          no preguntar nada (para automatizar)
 #   --port N            puerto de Unbound (por defecto 5335)
-#   --keep-fallback     conserva el fallback_dns externo de AdGuard (más tolerante
-#                       a fallos, pero puede saltarse Unbound si este cae)
+#   --no-fallback       vacía el fallback_dns de AdGuard: Unbound queda como único
+#                       camino (si cae, la red entera se queda sin DNS)
+#   --keep-fallback     comportamiento por defecto; se acepta por compatibilidad
 #
 set -Eeuo pipefail
 
@@ -27,7 +28,7 @@ UNBOUND_ADDR="127.0.0.1"
 UNBOUND_CONF="/etc/unbound/unbound.conf.d/adguard-home.conf"
 BACKUP_ROOT="/root/adguard-unbound-backups"
 ASSUME_YES=0
-KEEP_FALLBACK=0
+KEEP_FALLBACK=1
 ACTION=""
 
 # ---------------------------------------------------------------- utilidades
@@ -43,6 +44,24 @@ red(){    printf '%s%s%s\n' "$C_R" "$*" "$C_0" >&2; }
 info(){   printf '%s%s%s\n' "$C_C" "$*" "$C_0"; }
 bold(){   printf '%s%s%s\n' "$C_B" "$*" "$C_0"; }
 
+usage(){
+  cat <<'USAGE'
+Uso:
+  adguard-toolkit.sh                  menú interactivo
+  adguard-toolkit.sh --status         solo diagnóstico, no cambia nada
+  adguard-toolkit.sh --unbound        añade/reconfigura Unbound (idempotente)
+  adguard-toolkit.sh --install-adguard
+  adguard-toolkit.sh --all            instala AdGuard si falta y luego Unbound
+  adguard-toolkit.sh --revert-unbound deshace la mejora
+
+Modificadores:
+  --yes | -y      no preguntar nada (para automatizar)
+  --port N        puerto de Unbound (por defecto 5335)
+  --no-fallback   vacía el fallback_dns de AdGuard: Unbound queda como único
+                  camino (si cae, la red entera se queda sin DNS)
+USAGE
+}
+
 # CONTROLLED=1 marca los fallos que el script ya ha explicado por su cuenta,
 # para que la trampa no añada un "ERROR" confuso encima.
 CONTROLLED=0
@@ -51,15 +70,32 @@ trap '(( CONTROLLED )) || red "ERROR: el script falló en la línea $LINENO (ord
 # Espera a que un servidor DNS empiece a responder. AdGuard Home puede tardar
 # bastante más de 3 s en servir consultas tras arrancar (carga listas de bloqueo),
 # así que hay que reintentar en vez de comprobar una sola vez.
-wait_for_dns(){ # wait_for_dns <ip> [puerto] [intentos]
-  local server="$1" port="${2:-53}" tries="${3:-20}" i
+wait_for_dns(){ # wait_for_dns <ip> [puerto] [intentos] [dominio]
+  local server="$1" port="${2:-53}" tries="${3:-20}" domain="${4:-cloudflare.com}" i
   for (( i = 0; i < tries; i++ )); do
-    if dig +time=2 +tries=1 "@${server}" -p "$port" cloudflare.com A +short 2>/dev/null | grep -q .; then
+    if dig +time=2 +tries=1 "@${server}" -p "$port" "$domain" A +short 2>/dev/null | grep -q .; then
       return 0
     fi
     sleep 2
   done
   return 1
+}
+
+# El puerto 53 saliente puede estar interceptado de forma transparente (un
+# dst-nat del 53 en el router, práctica común en ISPs y redes corporativas).
+# En una red así la recursión es IMPOSIBLE: el interceptor responde a las
+# consultas iterativas (RD=0) solo desde su caché y devuelve SERVFAIL para el
+# resto, con lo que Unbound parece instalado y "casi" funcionar — resuelve los
+# dominios populares y falla el resto. Peor aún: la prueba clásica de DNSSEC
+# ("dnssec-failed.org debe dar SERVFAIL") PASA en esa red por el motivo
+# equivocado, así que no sirve como validación por sí sola.
+#
+# Detección: preguntar a una IP de TEST-NET (192.0.2.1, RFC 5737). Ahí no puede
+# existir ningún servidor DNS, de modo que CUALQUIER respuesta delata al
+# interceptor. Sin interceptación la consulta simplemente agota el tiempo.
+hijack53_detected(){ # -> 0 si el 53 saliente está interceptado
+  dig @192.0.2.1 hijack-test.invalid A +norec +time=3 +tries=1 2>/dev/null \
+    | grep -q 'status:'
 }
 
 ask(){ # ask "pregunta" -> 0 si sí
@@ -85,10 +121,28 @@ need_apt(){
   fi
 }
 
+need_dig(){
+  if ! command -v dig >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y dnsutils
+  fi
+}
+
 new_backup_dir(){
   local d="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$d"
   printf '%s' "$d"
+}
+
+primary_ip(){
+  # La IP con la que se sale hacia Internet. `hostname -I` devuelve la primera
+  # de la lista, que en hosts con Docker suele ser la de docker0.
+  local ip
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null \
+        | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  [[ -z "$ip" ]] && ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  printf '%s' "${ip:-<ip-del-servidor>}"
 }
 
 # ------------------------------------------------------- detección de AdGuard
@@ -202,6 +256,15 @@ PY
   echo "Puerto 53:"
   ss -lntup 2>/dev/null | grep -E '(:53[[:space:]]|:53$)' | sed 's/^/  /' \
     || echo "  (nadie escuchando)"
+
+  if command -v dig >/dev/null 2>&1; then
+    echo
+    if hijack53_detected; then
+      red "Red          : el puerto 53 saliente está INTERCEPTADO -> la recursión NO funcionará aquí"
+    else
+      green "Red          : puerto 53 saliente limpio (la recursión es posible)"
+    fi
+  fi
   bold "================================================="
 }
 
@@ -239,15 +302,22 @@ install_adguard(){
   sleep 3
   detect_adguard
   if [[ "$AGH_MODE" == "none" ]]; then
-    red "La instalación de AdGuard Home no se pudo verificar."
-    CONTROLLED=1
-    return 1
+    # Nota: recién instalado, AdGuardHome.yaml no existe hasta completar el
+    # asistente web, así que aquí AGH_MODE seguirá siendo "none" aunque la
+    # instalación haya ido bien. Comprobar el binario/servicio, no el YAML.
+    if ! systemctl list-unit-files AdGuardHome.service >/dev/null 2>&1 \
+       && ! pgrep -x AdGuardHome >/dev/null 2>&1; then
+      red "La instalación de AdGuard Home no se pudo verificar."
+      CONTROLLED=1
+      return 1
+    fi
   fi
 
-  green "AdGuard Home instalado: $AGH_YAML"
-  local ip; ip="$(hostname -I | awk '{print $1}')"
-  bold "Abre http://${ip}:3000 para completar el asistente inicial."
-  yellow "Termina ese asistente ANTES de aplicar la mejora de Unbound."
+  green "AdGuard Home instalado."
+  bold "Abre http://$(primary_ip):3000 para completar el asistente inicial."
+  yellow "Termina ese asistente ANTES de aplicar la mejora de Unbound: hasta"
+  yellow "entonces no existe AdGuardHome.yaml, y al terminarlo el asistente"
+  yellow "escribiría su propio upstream encima de cualquier cambio previo."
 }
 
 # ---------------------------------------------------- instalación de Unbound
@@ -265,6 +335,29 @@ install_unbound(){
     yellow "Un contenedor NO alcanza 127.0.0.1 del host: tendrás que usar la IP del host"
     yellow "(o red 'host') y poner el upstream a mano en la interfaz web."
   fi
+
+  # Antes de tocar nada: ¿esta red permite recursión? Si el 53 saliente está
+  # interceptado, TODO lo demás saldría "bien" (instalación, arranque, incluso
+  # la prueba de DNSSEC) y el resolver quedaría roto para media Internet.
+  info "==> Comprobando que la red permite resolución recursiva..."
+  need_dig
+  if hijack53_detected; then
+    red "El puerto 53 saliente está INTERCEPTADO: la IP de prueba 192.0.2.1"
+    red "(TEST-NET, ahí no puede existir ningún DNS) ha respondido."
+    red ""
+    red "La resolución recursiva NO puede funcionar en esta red: Unbound daría"
+    red "SERVFAIL en la mayoría de dominios (los populares sí resolverían, desde"
+    red "la caché del interceptor, lo que hace el fallo aún más confuso)."
+    red ""
+    red "Opciones:"
+    red "  1) Localiza la redirección (p. ej. un dst-nat del puerto 53 en el"
+    red "     router/MikroTik) y exime la IP de este servidor, UDP y TCP."
+    red "  2) O usa upstreams cifrados en AdGuard (tls://1.1.1.1, tls://9.9.9.9...)"
+    red "     en lugar de recursión: el 853 no suele estar interceptado."
+    CONTROLLED=1
+    return 1
+  fi
+  green "Puerto 53 saliente limpio: la recursión es posible."
 
   local BACKUP_DIR; BACKUP_DIR="$(new_backup_dir)"
 
@@ -346,8 +439,23 @@ server:
     use-syslog: yes
 EOF
 
-  info "==> Validando configuración..."
-  unbound-checkconf "$UNBOUND_CONF"
+  info "==> Validando la configuración completa..."
+  # Sin argumento, unbound-checkconf valida unbound.conf CON todos sus includes
+  # (el resto de conf.d/). Pasarle solo este fichero validaría el fichero
+  # aislado y no detectaría conflictos entre ficheros — justo la clase de error
+  # del trust anchor duplicado.
+  if ! unbound-checkconf; then
+    red "La configuración combinada de Unbound no valida (ver error de arriba)."
+    if [[ -f "$BACKUP_DIR/$(basename "$UNBOUND_CONF")" ]]; then
+      cp -a "$BACKUP_DIR/$(basename "$UNBOUND_CONF")" "$UNBOUND_CONF"
+      red "Se restauró la configuración anterior de $UNBOUND_CONF."
+    else
+      rm -f "$UNBOUND_CONF"
+      red "Se eliminó $UNBOUND_CONF para no dejar una configuración rota."
+    fi
+    CONTROLLED=1
+    return 1
+  fi
 
   # unbound-resolvconf reescribe /etc/resolv.conf vía resolvconf. Si resolv.conf
   # no es un symlink gestionado, falla en bucle y solo mete ruido.
@@ -380,7 +488,24 @@ EOF
     CONTROLLED=1
     return 1
   fi
-  green "Resolución IPv4 por Unbound: OK"
+
+  # Los dominios populares pueden salir de cualquier caché intermedia y esconder
+  # una recursión a medias; los poco consultados obligan a recursar de verdad.
+  local d fails=0
+  for d in nlnetlabs.nl suckless.org riken.jp; do
+    if ! dig +time=8 +tries=1 @127.0.0.1 -p "$UNBOUND_PORT" "$d" A +short 2>/dev/null | grep -q .; then
+      yellow "  control $d: sin respuesta"
+      fails=$((fails+1))
+    fi
+  done
+  if (( fails >= 2 )); then
+    red "La recursión no funciona de verdad: fallan $fails de 3 dominios de control"
+    red "poco consultados (los populares pueden responder desde cachés intermedias)."
+    journalctl -u unbound -n 40 --no-pager
+    CONTROLLED=1
+    return 1
+  fi
+  green "Resolución recursiva por Unbound: OK"
 
   if ip -6 route show default 2>/dev/null | grep -q .; then
     if dig +time=5 +tries=1 @127.0.0.1 -p "$UNBOUND_PORT" google.com AAAA +short | grep -q ':'; then
@@ -390,10 +515,21 @@ EOF
     fi
   fi
 
-  if dig @127.0.0.1 -p "$UNBOUND_PORT" dnssec-failed.org A 2>/dev/null | grep -q "SERVFAIL"; then
-    green "Validación DNSSEC: OK (rechaza dominios con firma inválida)"
+  # DNSSEC con control positivo Y negativo. Solo la pareja distingue una
+  # validación real de una recursión rota: un resolver roto también da SERVFAIL
+  # en el dominio mal firmado, y "pasaría" la prueba negativa por sí sola.
+  local sec_ok=0 sec_bad=0
+  dig @127.0.0.1 -p "$UNBOUND_PORT" +time=8 sigok.verteiltesysteme.net A 2>/dev/null \
+    | grep -Eq 'flags:[^;]* ad[ ;]' && sec_ok=1
+  dig @127.0.0.1 -p "$UNBOUND_PORT" +time=8 dnssec-failed.org A 2>/dev/null \
+    | grep -q 'SERVFAIL' && sec_bad=1
+  if (( sec_ok && sec_bad )); then
+    green "Validación DNSSEC: OK (firma válida con 'ad', firma inválida rechazada)"
+  elif (( sec_bad )); then
+    yellow "dnssec-failed.org da SERVFAIL pero el control positivo no trae 'ad';"
+    yellow "revisa el trust anchor (/var/lib/unbound/root.key)."
   else
-    yellow "La prueba DNSSEC no dio SERVFAIL; revisa el trust anchor."
+    yellow "La validación DNSSEC no se pudo confirmar; revisa el trust anchor."
   fi
 
   # ------------------------------------------------ enganchar con AdGuard
@@ -405,14 +541,19 @@ EOF
   fi
 
   info "==> Configurando AdGuard Home: $AGH_YAML"
-  local SNAP="$BACKUP_DIR/AdGuardHome.yaml.before-unbound"
-  cp -a "$AGH_YAML" "$SNAP"
 
+  # Parar ANTES de copiar: AdGuard reescribe su YAML desde memoria al apagarse,
+  # así que un snapshot tomado con el servicio vivo puede ser una versión vieja
+  # si el administrador tocó algo por la interfaz web desde el último volcado.
   local WAS_ACTIVE=0
   if [[ -n "$AGH_SERVICE" ]] && systemctl is-active --quiet "$AGH_SERVICE"; then
     WAS_ACTIVE=1
     agh_stop
+    sleep 1
   fi
+
+  local SNAP="$BACKUP_DIR/AdGuardHome.yaml.before-unbound"
+  cp -a "$AGH_YAML" "$SNAP"
 
   python3 - "$AGH_YAML" "${UNBOUND_ADDR}:${UNBOUND_PORT}" "$KEEP_FALLBACK" <<'PY'
 import sys, yaml
@@ -423,7 +564,12 @@ dns = cfg.setdefault("dns", {})
 # upstream_dns_file tiene prioridad sobre upstream_dns: hay que vaciarlo.
 dns["upstream_dns_file"] = ""
 dns["upstream_dns"] = [upstream]
-if not keep_fb and "fallback_dns" in dns:
+if keep_fb:
+    # Red de seguridad si Unbound cae. Cifrada (DoT) para no depender del 53
+    # en claro. Solo se añade si no había ya un fallback configurado.
+    if not dns.get("fallback_dns"):
+        dns["fallback_dns"] = ["tls://9.9.9.9"]
+else:
     dns["fallback_dns"] = []
 with open(path, "w", encoding="utf-8") as f:
     yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
@@ -431,9 +577,11 @@ PY
 
   (( WAS_ACTIVE )) && agh_start || agh_restart
 
-  # Verificación con reversión automática si el DNS se rompe.
-  info "==> Esperando a que AdGuard vuelva a responder (hasta 40 s)..."
-  if wait_for_dns 127.0.0.1 53; then
+  # Verificación con reversión automática si el DNS se rompe. Se consulta un
+  # dominio poco popular: uno popular podría responder desde la caché del propio
+  # AdGuard sin atravesar el upstream nuevo, que es justo lo que hay que probar.
+  info "==> Esperando a que AdGuard responda a través de Unbound (hasta 40 s)..."
+  if wait_for_dns 127.0.0.1 53 20 nlnetlabs.nl; then
     green "Cadena AdGuard -> Unbound -> Internet: OK"
   else
     red "AdGuard no responde tras el cambio. Restaurando la configuración anterior..."
@@ -455,13 +603,32 @@ PY
   echo "AdGuard Home   : sigue sirviendo el puerto 53 a tus clientes"
   echo "Backup         : $BACKUP_DIR"
   if (( KEEP_FALLBACK )); then
-    echo "fallback_dns   : conservado (tolerante a fallos)"
+    echo "fallback_dns   : conservado (red de seguridad si Unbound cae)"
+    yellow "Nota: el fallback actúa cuando Unbound NO RESPONDE. Un SERVFAIL sí es"
+    yellow "respuesta y no lo dispara (p. ej. si mañana algo intercepta el 53)."
   else
-    yellow "fallback_dns   : vaciado -> si Unbound cae, la red se queda sin DNS."
-    yellow "                 Usa --keep-fallback si prefieres una red de seguridad."
+    yellow "fallback_dns   : vaciado (--no-fallback) -> si Unbound cae, la red se queda sin DNS."
   fi
   echo
   echo "No expongas el puerto ${UNBOUND_PORT} a Internet ni a los clientes."
+}
+
+# --------------------------------------------- AdGuard + Unbound de una vez
+install_all(){
+  install_adguard || true
+  detect_adguard
+  if [[ "$AGH_MODE" != "native" ]]; then
+    # Recién instalado, el YAML no existe hasta completar el asistente web.
+    # Configurar Unbound ahora sería inútil: al terminar el asistente, AdGuard
+    # escribiría su propio upstream encima y la mejora quedaría deshecha en
+    # silencio. Mejor parar aquí con instrucciones claras.
+    echo
+    yellow "AdGuard Home aún no tiene configuración (falta completar el asistente web)."
+    bold   "1) Abre http://$(primary_ip):3000 y completa el asistente."
+    bold   "2) Después ejecuta:  adguard-toolkit.sh --unbound"
+    return 0
+  fi
+  install_unbound
 }
 
 # ------------------------------------------------------------- revertir
@@ -476,8 +643,8 @@ revert_unbound(){
     if [[ -n "$SNAP" ]]; then
       info "Restaurando AdGuard desde: $SNAP"
       ask "¿Restaurar la configuración de AdGuard anterior a Unbound?" || { yellow "Cancelado."; CONTROLLED=1; return 1; }
-      cp -a "$AGH_YAML" "${AGH_YAML}.before-revert"
       agh_stop
+      cp -a "$AGH_YAML" "${AGH_YAML}.before-revert"
       cp -a "$SNAP" "$AGH_YAML"
       agh_start
       wait_for_dns 127.0.0.1 53 || true
@@ -509,7 +676,11 @@ PY
     apt-get autoremove -y >/dev/null
     green "Unbound desinstalado."
   else
-    yellow "Unbound sigue instalado; AdGuard ya no lo usa."
+    # Ya nadie lo usa: pararlo y deshabilitarlo, pero conservarlo instalado.
+    # unbound-resolvconf se queda enmascarado a propósito mientras el paquete
+    # siga presente (reactivarlo volvería a pelearse con /etc/resolv.conf).
+    systemctl disable --now unbound >/dev/null 2>&1 || true
+    yellow "Unbound queda instalado pero parado y deshabilitado; AdGuard ya no lo usa."
   fi
 
   if wait_for_dns 127.0.0.1 53; then
@@ -552,7 +723,7 @@ menu(){
   case "${opt:-0}" in
     1) show_status;;
     2) if [[ "$AGH_MODE" == "none" ]]; then install_adguard; else install_unbound; fi;;
-    3) if [[ "$AGH_MODE" == "none" ]]; then install_adguard && install_unbound; else revert_unbound; fi;;
+    3) if [[ "$AGH_MODE" == "none" ]]; then install_all; else revert_unbound; fi;;
     *) echo "Saliendo.";;
   esac
 }
@@ -566,10 +737,11 @@ while [[ $# -gt 0 ]]; do
     --all)             ACTION="all";;
     --revert-unbound)  ACTION="revert";;
     --yes|-y)          ASSUME_YES=1;;
-    --keep-fallback)   KEEP_FALLBACK=1;;
+    --no-fallback)     KEEP_FALLBACK=0;;
+    --keep-fallback)   KEEP_FALLBACK=1;;  # comportamiento por defecto; compat
     --port)            shift || true; UNBOUND_PORT="${1:-}";;
-    -h|--help)         sed -n '2,26p' "$0"; exit 0;;
-    *) red "Opción desconocida: $1"; sed -n '2,26p' "$0"; exit 1;;
+    -h|--help)         usage; exit 0;;
+    *) red "Opción desconocida: $1"; usage; exit 1;;
   esac
   shift || true
 done
@@ -588,7 +760,7 @@ case "$ACTION" in
   status)  show_status;;
   unbound) install_unbound;;
   adguard) install_adguard;;
-  all)     install_adguard || true; install_unbound;;
+  all)     install_all;;
   revert)  revert_unbound;;
   "")      if [[ -t 0 ]]; then menu; else show_status; fi;;
 esac
