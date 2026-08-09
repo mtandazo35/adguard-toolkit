@@ -16,7 +16,46 @@ escuchando solo en `127.0.0.1:5335`, sin exponerse a la red.
 clientes  →  AdGuard Home (:53, filtrado)  →  Unbound (127.0.0.1:5335, recursivo)  →  raíz DNS
 ```
 
+## ⚡ Quick install (one-liner)
+
+Como `root` en tu servidor Debian/Ubuntu:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/mtandazo35/adguard-toolkit/main/adguard-toolkit.sh)
+```
+
+Abre el menú interactivo, que cambia según lo que encuentre en la máquina.
+
+**Desatendido**, sin preguntas (instala AdGuard si falta y luego añade Unbound):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mtandazo35/adguard-toolkit/main/adguard-toolkit.sh | bash -s -- --all --yes
+```
+
+**Solo diagnóstico**, no toca nada:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mtandazo35/adguard-toolkit/main/adguard-toolkit.sh | bash -s -- --status
+```
+
+> **Ojo con `curl … | bash` sin flags.** Al tuberizar, la entrada estándar deja de ser
+> una terminal y el menú no puede leer tus respuestas. En ese caso el script no
+> adivina nada: se comporta como `--status` y no modifica el sistema. Para el menú
+> usa la forma `bash <(curl …)`, que conserva la terminal en stdin.
+
+Si prefieres revisar el script antes de ejecutarlo — recomendable con cualquier
+instalador que venga de Internet:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mtandazo35/adguard-toolkit/main/adguard-toolkit.sh -o adguard-toolkit.sh
+less adguard-toolkit.sh
+chmod +x adguard-toolkit.sh
+./adguard-toolkit.sh
+```
+
 ## Uso
+
+También puedes copiarlo a mano:
 
 ```bash
 scp adguard-toolkit.sh root@TU_SERVIDOR:/root/
